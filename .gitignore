@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.html
+*.txt
+
+# Теннисные скрипты (другой проект)
+NewOddsPediaScraper_Scrapling_v3.py
+SFSMatchScraper_New_v1.py
+
+# Старый скрипт
+lj_scraper.py
