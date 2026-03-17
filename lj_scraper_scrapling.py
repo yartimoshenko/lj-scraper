@@ -1797,9 +1797,64 @@ def generate_top_level_index(archive_dir: Path, authors: list[dict]):
         )
     authors_html = "\n".join(author_cards)
 
-    # Секция годов (с указанием авторов)
+    # Генерируем страницы по годам (верхний уровень)
+    top_content_dir = archive_dir / "Content"
+    top_content_dir.mkdir(parents=True, exist_ok=True)
+
+    for year, year_posts in sorted(by_year.items()):
+        items_html = "\n".join(
+            f'''<li class="post-item">
+              <span class="post-num">{i}</span>
+              <div style="flex:1">
+                <a class="post-link" href="../{p["rel_path"]}">{p["title"] or "Без заголовка"}</a>
+                <div class="post-tags-inline">
+                  {f'<span class="post-meta">[{p["nick"]}]</span>' }
+                  {f'<span class="post-meta">{p["post_date"]}</span>' if p.get("post_date") else ""}
+                  {"".join(f'<a class="post-tag-mini" href="{_tag_href(t)}">{t}</a>' for t in p["tags"])}
+                </div>
+              </div>
+            </li>'''
+            for i, p in enumerate(year_posts, 1)
+        )
+        cnt = len(year_posts)
+        body = f'''<div class="site-header">
+  <div class="site-title">{year}</div>
+  <div class="site-subtitle">{cnt} {"пост" if cnt == 1 else "постов"} · все авторы</div>
+</div>
+<ul class="post-list">{items_html}</ul>'''
+        page = _nav_page(f"{year} — Архив", body, "../01.MAIN.html", "На главную")
+        (top_content_dir / f"year_{year}.html").write_text(page, encoding="utf-8")
+
+    # Генерируем страницы по тегам (верхний уровень)
+    for tag, tag_posts in sorted(by_tag.items()):
+        items_html = "\n".join(
+            f'''<li class="post-item">
+              <span class="post-num">{i}</span>
+              <div style="flex:1">
+                <a class="post-link" href="../{p["rel_path"]}">{p["title"] or "Без заголовка"}</a>
+                <div class="post-tags-inline">
+                  <span class="post-meta">[{p["nick"]}]</span>
+                  <span class="post-meta">{p.get("post_date") or p["year"]}</span>
+                  {"".join(f'<a class="post-tag-mini" href="{_tag_href(t)}">{t}</a>' for t in p["tags"])}
+                </div>
+              </div>
+            </li>'''
+            for i, p in enumerate(tag_posts, 1)
+        )
+        cnt = len(tag_posts)
+        body = f'''<div class="site-header">
+  <div class="site-title">#{tag}</div>
+  <div class="site-subtitle">{cnt} {"пост" if cnt == 1 else "постов"} · все авторы</div>
+</div>
+<ul class="post-list">{items_html}</ul>'''
+        page = _nav_page(f"#{tag} — Архив", body, "../01.MAIN.html", "На главную")
+        (top_content_dir / _tag_filename(tag)).write_text(page, encoding="utf-8")
+
+    print(f"  Top-level year pages: {len(by_year)}, tag pages: {len(by_tag)}")
+
+    # Секция годов
     years_html = "\n".join(
-        f'<a class="year-card" href="javascript:void(0)" onclick="this.querySelector(\'.cnt\').style.display=\'block\'">'
+        f'<a class="year-card" href="Content/year_{yr}.html">'
         f'<span class="yr">{yr}</span>'
         f'<span class="cnt">{len(ps)} постов</span></a>'
         for yr, ps in sorted(by_year.items())
@@ -1807,7 +1862,7 @@ def generate_top_level_index(archive_dir: Path, authors: list[dict]):
 
     # Секция тегов
     tags_html = "\n".join(
-        f'<a class="tag-chip" href="javascript:void(0)">'
+        f'<a class="tag-chip" href="Content/{_tag_href(t)}">'
         f'{t}<span class="tag-count">{len(ps)}</span></a>'
         for t, ps in sorted(by_tag.items(), key=lambda x: -len(x[1]))
     )
