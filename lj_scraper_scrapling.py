@@ -17,6 +17,7 @@ import random
 import hashlib
 import asyncio
 import logging
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 from lxml import etree
@@ -788,28 +789,60 @@ async def collect_month_urls(session: AsyncSession, year_url: str, author_base: 
     if status != 200 or doc is None:
         return []
 
-    alpha = doc.find(".//*[@id='alpha-inner']")
-    if alpha is None:
-        return []
-
     month_urls = []
-    for a in alpha.iter("a"):
+
+    # Способ 1: ищем "View Subjects" ссылки внутри #alpha-inner (классический шаблон)
+    alpha = doc.find(".//*[@id='alpha-inner']")
+    search_root = alpha if alpha is not None else doc
+    for a in search_root.iter("a"):
         text = _el_text(a)
         if "View Subjects" in text:
             href = a.get("href", "")
             if href.startswith(author_base):
                 month_urls.append(href)
+
+    # Способ 2 (fallback): ищем ссылки на месяцы вида author_base/YYYY/MM/
+    if not month_urls:
+        # Извлекаем год из URL
+        year_match = re.search(r'/(\d{4})/?$', year_url.rstrip('/'))
+        if year_match:
+            year_str = year_match.group(1)
+            month_pat = re.compile(
+                r'^' + re.escape(author_base.rstrip('/')) + r'/' + re.escape(year_str) + r'/\d{2}$'
+            )
+            seen = set()
+            for a in doc.iter("a"):
+                href = (a.get("href") or "").rstrip("/")
+                if month_pat.match(href) and href not in seen:
+                    seen.add(href)
+                    # Сохраняем с trailing slash (формат "View Subjects" ссылок)
+                    month_urls.append(href + "/")
+            month_urls.sort()
+
     return month_urls
 
 
 def collect_post_urls_from_month_doc(doc, author_base: str) -> list[str]:
     """Извлекает ссылки на посты из lxml-документа страницы месяца."""
     post_urls = []
+
+    # Способ 1: ищем внутри элементов с классом 'viewsubjects'
     for el in doc.xpath(".//*[contains(@class, 'viewsubjects')]"):
         for a in el.iter("a"):
             href = a.get("href", "")
             if href.startswith(author_base) and re.search(r'/\d+\.html', href):
                 post_urls.append(href)
+
+    # Способ 2 (fallback): ищем все ссылки на посты по всему документу
+    if not post_urls:
+        seen = set()
+        post_pat = re.compile(r'^' + re.escape(author_base.rstrip('/')) + r'/\d+\.html$')
+        for a in doc.iter("a"):
+            href = a.get("href", "")
+            if post_pat.match(href) and href not in seen:
+                seen.add(href)
+                post_urls.append(href)
+
     return post_urls
 
 
@@ -876,30 +909,86 @@ async def collect_all_post_urls(session: AsyncSession, author_base: str,
 #  ИНТЕРАКТИВНЫЙ ВВОД ПАРАМЕТРОВ
 # ═══════════════════════════════════════════════════════════════
 
-def ask_author_base() -> str:
+def extract_nickname(url: str) -> str:
+    """Извлекает никнейм автора из URL ЖЖ."""
+    parsed = urlparse(url)
+    host = parsed.netloc or ""
+    # palaman.livejournal.com → palaman
+    if host.endswith(".livejournal.com"):
+        nick = host.split(".")[0]
+        if nick and nick != "www":
+            return nick
+    # www.livejournal.com/users/palaman/ → palaman
+    m = re.search(r'/users/([\w-]+)', parsed.path)
+    if m:
+        return m.group(1)
+    return host.split(".")[0]
+
+
+def _validate_lj_url(raw: str) -> str | None:
+    """Валидирует и нормализует один URL ЖЖ. Возвращает URL или None."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    if not raw.startswith("http"):
+        raw = "https://" + raw
+    # Одиночный пост
+    if re.search(r'/\d+\.html$', raw):
+        return raw
+    if not raw.endswith("/"):
+        raw += "/"
+    if re.match(r'https?://[\w-]+\.livejournal\.com/', raw):
+        return raw
+    return None
+
+
+def ask_authors() -> list[dict]:
+    """Запрашивает одного или нескольких авторов.
+    Возвращает список: [{"base_url": str, "nickname": str, "single_post_url": str|None}]"""
     while True:
         raw = input(
-            "\nURL автора или поста на LJ\n"
+            "\nURL автора (или нескольких через запятую)\n"
             "  Архив:  https://palaman.livejournal.com/\n"
+            "  Несколько: https://palaman.livejournal.com/, https://krylov.livejournal.com/\n"
             "  Пост:   https://palaman.livejournal.com/12345.html\n"
             "> "
         ).strip()
         if not raw:
             continue
-        if not raw.startswith("http"):
-            raw = "https://" + raw
-        if re.search(r'/\d+\.html$', raw):
-            return raw
-        if not raw.endswith("/"):
-            raw += "/"
-        if re.match(r'https?://[\w-]+\.livejournal\.com/', raw):
-            return raw
-        print("  Check URL format")
+
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        authors = []
+        all_valid = True
+        for part in parts:
+            url = _validate_lj_url(part)
+            if not url:
+                print(f"  Bad URL: {part}")
+                all_valid = False
+                break
+
+            single_post_url = None
+            if re.search(r'/\d+\.html$', url):
+                single_post_url = url
+                base_url = re.match(r'(https?://[^/]+/)', url).group(1)
+            else:
+                base_url = url
+
+            nick = extract_nickname(base_url)
+            authors.append({
+                "base_url": base_url,
+                "nickname": nick,
+                "single_post_url": single_post_url,
+            })
+
+        if all_valid and authors:
+            nicks = [a["nickname"] for a in authors]
+            print(f"  Authors: {', '.join(nicks)}")
+            return authors
 
 
 def ask_archive_dir() -> Path:
     while True:
-        raw = input("Save folder (e.g. D:\\PalamanArchive): ").strip()
+        raw = input("Save folder (e.g. D:\\Archive): ").strip()
         if not raw:
             continue
         p = Path(raw)
@@ -911,17 +1000,67 @@ def ask_archive_dir() -> Path:
 
 
 def ask_years() -> list[int]:
+    current_year = datetime.now().year
     print("Years to download:")
-    print("  Examples: 2019  |  2017,2018,2019  |  2015-2019  |  2012-2014,2018")
-    while True:
-        raw = input("Years: ").strip()
-        if not raw:
+    print(f"  Examples: 2019  |  2017,2018,2019  |  2015-2019  |  2012-2014,2018")
+    print(f"  Leave empty to check all years ({YEAR_MIN}-{current_year})")
+    raw = input("Years: ").strip()
+    if not raw:
+        years = list(range(YEAR_MIN, current_year + 1))
+        print(f"  Will check all years: {YEAR_MIN}-{current_year}")
+        return years
+    years = parse_years_input(raw)
+    if years:
+        print(f"  Selected: {years}")
+        return years
+    # Fallback: все годы
+    print(f"  Cannot parse — will check all years: {YEAR_MIN}-{current_year}")
+    return list(range(YEAR_MIN, current_year + 1))
+
+
+def check_existing_archives(archive_dir: Path, authors: list[dict]) -> dict[str, bool]:
+    """Проверяет существующие папки авторов, показывает статистику.
+    Возвращает dict {nickname: skip_existing (True=пропускать, False=перекачать)}."""
+    skip_map = {}
+    for author in authors:
+        nick = author["nickname"]
+        content_dir = archive_dir / nick / "Content"
+        if not content_dir.exists():
+            skip_map[nick] = True
             continue
-        years = parse_years_input(raw)
-        if years:
-            print(f"  Selected: {years}")
-            return years
-        print(f"  Cannot parse. Range: {YEAR_MIN}-{YEAR_MAX}")
+
+        # Считаем посты и годы
+        years_found = set()
+        post_count = 0
+        parser = etree.HTMLParser(encoding="utf-8")
+        for fpath in content_dir.glob("*.html"):
+            if not fpath.stem.isdigit():
+                continue
+            post_count += 1
+            try:
+                raw = fpath.read_bytes()[:2000]
+                doc = etree.fromstring(raw, parser)
+                html_root = doc.getroottree().getroot()
+                yr = (html_root.get("data-year", "") or "")[:4]
+                if yr.isdigit():
+                    years_found.add(yr)
+            except Exception:
+                pass
+
+        if post_count == 0:
+            skip_map[nick] = True
+            continue
+
+        years_str = ", ".join(sorted(years_found)) if years_found else "?"
+        print(f"\n  Author '{nick}' already has {post_count} posts (years: {years_str})")
+        choice = input("  Re-download existing posts or skip? [s=skip / r=re-download, default=skip]: ").strip().lower()
+        skip_map[nick] = (choice != "r")
+        if skip_map[nick]:
+            print(f"    → Will skip existing posts for {nick}")
+        else:
+            print(f"    → Will re-download all posts for {nick}")
+
+    return skip_map
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1081,7 +1220,8 @@ def _nav_page(title: str, body_html: str, back_href: str = "", back_label: str =
 </html>"""
 
 
-def generate_index(archive_dir: Path, author_base: str = "", content_dir: Path = None):
+def generate_index(archive_dir: Path, author_base: str = "", content_dir: Path = None,
+                    parent_link: str = ""):
     from collections import defaultdict
 
     if content_dir is None:
@@ -1256,99 +1396,96 @@ def generate_index(archive_dir: Path, author_base: str = "", content_dir: Path =
     ]
     body = "\n".join(body_parts)
 
-    main_page = _nav_page(f"{author_name} — Архив", body)
+    back_href = parent_link if parent_link else ""
+    back_label = "Все авторы" if parent_link else ""
+    main_page = _nav_page(f"{author_name} — Архив", body,
+                           back_href=back_href, back_label=back_label)
     (archive_dir / "01.MAIN.html").write_text(main_page, encoding="utf-8")
 
-    print(f"\n  01.MAIN.html created")
+    print(f"\n  {author_name}/01.MAIN.html created")
     print(f"\n  Content: {content_dir}")
     print("=" * 60)
 
 
 # ═══════════════════════════════════════════════════════════════
-#  ТОЧКА ВХОДА
+#  ЗАГРУЗКА ПОСТОВ ОДНОГО АВТОРА
 # ═══════════════════════════════════════════════════════════════
 
-def main():
-    print("=" * 60)
-    print("  LiveJournal Archive Scraper (Scrapling edition)")
-    print("  No proxies, no browser UI needed")
-    print("=" * 60)
+async def download_author_posts(session: AsyncSession, post_urls: list[str],
+                                 content_dir: Path, author_base: str,
+                                 skip_existing: bool = True) -> dict:
+    """Скачивает посты одного автора. Возвращает статистику."""
+    success_count = 0
+    skip_count = 0
+    error_count = 0
+    consecutive_errors = 0
+    failed_items = []
 
-    author_base = ask_author_base()
-    archive_dir = ask_archive_dir()
+    # Фильтруем уже скачанные
+    to_download = []
+    for i, purl in enumerate(post_urls, 1):
+        post_id = extract_post_id(purl)
+        out_file = content_dir / f"{post_id}.html"
+        if skip_existing and out_file.exists():
+            print(f"  [{i}/{len(post_urls)}] {post_id} -- already exists, skip")
+            skip_count += 1
+        else:
+            to_download.append((i, purl))
 
-    single_post_mode = bool(re.search(r'/\d+\.html$', author_base))
-    if single_post_mode:
-        post_url = author_base
-        author_base = re.match(r'(https?://[^/]+/)', author_base).group(1)
-        years = []
+    if not to_download:
+        print("\n  All posts already downloaded.")
     else:
-        years = ask_years()
+        print(f"\n  Downloading {len(to_download)} posts (semaphore={PARALLEL_POSTS})...\n")
 
-    content_dir = archive_dir / "Content"
-    content_dir.mkdir(parents=True, exist_ok=True)
+    sem = asyncio.Semaphore(PARALLEL_POSTS)
 
-    # Весь скрейпинг — через одну AsyncSession (как настоящий браузер)
-    asyncio.run(_async_main(author_base, archive_dir, content_dir,
-                             years, single_post_mode,
-                             post_url if single_post_mode else None))
+    async def _download_one(idx: int, purl: str):
+        nonlocal success_count, error_count, consecutive_errors
+        pid = extract_post_id(purl)
+        async with sem:
+            print(f"\n  [{idx}/{len(post_urls)}] Post {pid}")
+            try:
+                ok = await scrape_post(session, purl, content_dir, author_base)
+                if ok:
+                    success_count += 1
+                    consecutive_errors = 0
+                else:
+                    error_count += 1
+                    consecutive_errors += 1
+                    failed_items.append((idx, purl))
+            except Exception as e:
+                print(f"  [{pid}] Error: {e}")
+                error_count += 1
+                consecutive_errors += 1
+                failed_items.append((idx, purl))
 
-
-async def _async_main(author_base: str, archive_dir: Path, content_dir: Path,
-                       years: list[int], single_post_mode: bool,
-                       single_post_url: str | None):
-    """Основной async-цикл с единой сессией."""
-
-    async with AsyncSession(impersonate="chrome", headers=_CHROME_HEADERS) as session:
-        # 1. Сбор списка постов
-        if single_post_mode:
-            post_urls = [single_post_url]
-        else:
-            post_urls = await collect_all_post_urls(session, author_base, years)
-
-        if not post_urls:
-            print("\nNo posts found. Check URL and years.")
-            return
-
-        print(f"\n{'='*60}")
-        print(f"  Ready to download: {len(post_urls)} posts")
-        print(f"  Folder: {archive_dir}")
-        print(f"{'='*60}")
-        confirm = input("\nStart downloading? [Enter = yes / n = no]: ").strip().lower()
-        if confirm == "n":
-            print("Cancelled.")
-            return
-
-        # 2. Фильтруем уже скачанные
-        success_count = 0
-        skip_count = 0
-        error_count = 0
-        consecutive_errors = 0
-
-        to_download = []
-        for i, purl in enumerate(post_urls, 1):
-            post_id = extract_post_id(purl)
-            out_file = content_dir / f"{post_id}.html"
-            if out_file.exists():
-                print(f"  [{i}/{len(post_urls)}] {post_id} -- already exists, skip")
-                skip_count += 1
+            if consecutive_errors >= 5:
+                print(f"\n  ⚠ {consecutive_errors} consecutive errors — pausing 10s...")
+                await asyncio.sleep(10)
+                consecutive_errors = 0
             else:
-                to_download.append((i, purl))
+                await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
-        if not to_download:
-            print("\n  All posts already downloaded.")
-        else:
-            print(f"\n  Downloading {len(to_download)} posts (semaphore={PARALLEL_POSTS})...\n")
+    tasks = [_download_one(idx, purl) for idx, purl in to_download]
+    await asyncio.gather(*tasks)
 
-        # 3. Загрузка постов — семафор вместо ThreadPool
-        sem = asyncio.Semaphore(PARALLEL_POSTS)
-        failed_items = []
+    # Retry
+    for retry_round in range(1, 3):
+        if not failed_items:
+            break
+        retry_list = list(failed_items)
+        failed_items.clear()
+        print(f"\n  RETRY round {retry_round}: {len(retry_list)} failed posts (waiting 10s...)")
+        await asyncio.sleep(10)
+        error_count -= len(retry_list)
+        consecutive_errors = 0
+        retry_sem = asyncio.Semaphore(max(1, PARALLEL_POSTS // (retry_round + 1)))
 
-        async def _download_one(idx: int, purl: str):
+        async def _retry_one(idx: int, purl: str):
             nonlocal success_count, error_count, consecutive_errors
             pid = extract_post_id(purl)
-            async with sem:
-                print(f"\n  [{idx}/{len(post_urls)}] Post {pid}")
+            async with retry_sem:
+                print(f"\n  [retry] Post {pid}")
                 try:
                     ok = await scrape_post(session, purl, content_dir, author_base)
                     if ok:
@@ -1361,74 +1498,480 @@ async def _async_main(author_base: str, archive_dir: Path, content_dir: Path,
                 except Exception as e:
                     print(f"  [{pid}] Error: {e}")
                     error_count += 1
-                    consecutive_errors += 1
                     failed_items.append((idx, purl))
+                await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
-                # Адаптивная пауза: при каскадных ошибках — длинная пауза
-                if consecutive_errors >= 5:
-                    print(f"\n  ⚠ {consecutive_errors} consecutive errors — pausing 10s...")
-                    await asyncio.sleep(10)
-                    consecutive_errors = 0
-                else:
-                    # Небольшая пауза между запросами
-                    await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+        retry_tasks = [_retry_one(idx, purl) for idx, purl in retry_list]
+        await asyncio.gather(*retry_tasks)
 
-        # Запускаем все задачи — семафор ограничивает параллелизм
-        tasks = [_download_one(idx, purl) for idx, purl in to_download]
-        await asyncio.gather(*tasks)
+    return {
+        "success": success_count, "skipped": skip_count,
+        "errors": error_count, "failed": failed_items,
+    }
 
-        # 4. Retry упавших постов
-        for retry_round in range(1, 3):
-            if not failed_items:
-                break
-            retry_list = list(failed_items)
-            failed_items.clear()
+
+# ═══════════════════════════════════════════════════════════════
+#  КРОСС-АВТОРСКИЕ ССЫЛКИ + СБОР ВНЕШНИХ ССЫЛОК
+# ═══════════════════════════════════════════════════════════════
+
+# Регекс для LJ-ссылок на посты
+_LJ_POST_URL_RE = re.compile(
+    r'href="((?:https?:)?//(?:(\w[\w-]*)\.livejournal\.com'
+    r'|(?:www\.)?livejournal\.com/users/(\w[\w-]*))'
+    r'/(\d+)\.html[^"]*)"'
+)
+
+
+def collect_and_rewrite_cross_links(archive_dir: Path, authors: list[dict]) -> list[tuple]:
+    """
+    Проход 2: перезаписывает кросс-авторские ссылки в HTML-файлах.
+    Возвращает список внешних ссылок: [(referencing_nick, ext_nick, post_url, post_id)]
+    """
+    nick_set = {a["nickname"] for a in authors}
+    external_links = []  # (referencing_nick, ext_nick, full_url, post_id)
+    seen_external = set()
+
+    for author in authors:
+        nick = author["nickname"]
+        content_dir = archive_dir / nick / "Content"
+        if not content_dir.exists():
+            continue
+
+        for fpath in content_dir.glob("*.html"):
+            if not fpath.stem.isdigit():
+                continue
+            try:
+                html = fpath.read_text(encoding="utf-8")
+            except Exception:
+                continue
+
+            modified = False
+
+            def _replace_link(m):
+                nonlocal modified
+                full_href = m.group(1)
+                target_nick = m.group(2) or m.group(3)
+                post_id = m.group(4)
+
+                if not target_nick:
+                    return m.group(0)
+
+                target_nick = target_nick.lower()
+
+                # Свой же автор — ссылка на локальный файл
+                if target_nick == nick:
+                    modified = True
+                    return f'href="{post_id}.html"'
+
+                # Другой скачиваемый автор — кросс-ссылка
+                if target_nick in nick_set:
+                    modified = True
+                    return f'href="../../{target_nick}/Content/{post_id}.html"'
+
+                # Внешний автор — запоминаем для скачивания
+                # Восстанавливаем полный URL
+                url = full_href
+                if url.startswith("//"):
+                    url = "https:" + url
+                key = (nick, target_nick, post_id)
+                if key not in seen_external:
+                    seen_external.add(key)
+                    external_links.append((nick, target_nick, url, post_id))
+                return m.group(0)  # пока не меняем — поменяем после скачивания
+
+            new_html = _LJ_POST_URL_RE.sub(_replace_link, html)
+            if modified:
+                fpath.write_text(new_html, encoding="utf-8")
+
+    return external_links
+
+
+# ═══════════════════════════════════════════════════════════════
+#  СКАЧИВАНИЕ ВНЕШНИХ ПОСТОВ (один уровень глубины)
+# ═══════════════════════════════════════════════════════════════
+
+async def scrape_external_post(session: AsyncSession, url: str,
+                                dest_dir: Path, filename: str,
+                                ext_author_base: str) -> bool:
+    """Скачивает один внешний пост без follow-up ссылок."""
+    out_file = dest_dir / filename
+    if out_file.exists():
+        return True
+
+    try:
+        doc, body_text, status = await async_fetch_and_parse(session, url, timeout=20)
+    except Exception as e:
+        print(f"    [ext] Error fetching {url}: {e}")
+        return False
+
+    if status != 200 or doc is None:
+        print(f"    [ext] HTTP {status} for {url}")
+        return False
+
+    title_span = doc.find(".//*[@class='aentry-post__title-text']")
+    if title_span is not None:
+        title = _el_text(title_span)
+    else:
+        title_el = doc.find(".//*[@class='aentry-post__title']")
+        title = _el_text(title_el) if title_el is not None else filename
+
+    tags = []
+    tags_container = doc.xpath(".//*[contains(@class,'aentry-tags')]")
+    for container in tags_container:
+        for a in container.iter("a"):
+            href = a.get("href", "")
+            if "/tag/" in href:
+                t = (a.text or "").strip().lstrip("#")
+                if t and t not in tags:
+                    tags.append(t)
+
+    content_el = doc.find(".//*[@class='aentry-post__content']")
+    if content_el is None:
+        return False
+
+    content_html = _el_inner_html(content_el)
+    # Скачиваем картинки, но НЕ переписываем ссылки (rewrite_links=False не нужен,
+    # просто передаём пустой author_base чтобы не матчить ссылки)
+    content_html = await process_html_images_and_links(session, content_html, dest_dir, author_base="")
+
+    post_date, year_str = parse_post_date(doc)
+    if not year_str:
+        ym = re.search(r"20\d{2}|19\d{2}", body_text[:3000])
+        year_str = ym.group(0) if ym else ""
+
+    # Комментарии
+    comments = await scrape_all_comments(session, url, dest_dir, ext_author_base)
+    comments_html = render_comments_html(comments)
+
+    post_id = extract_post_id(url) or filename.replace(".html", "")
+    html = build_html(title, tags, content_html, url,
+                      comments_html, len(comments),
+                      year=year_str, post_id=post_id, post_date=post_date)
+    out_file.write_text(html, encoding="utf-8")
+
+    ext_nick = extract_nickname(url)
+    print(f"    [ext] {ext_nick}/{post_id}  {title[:50]}  |  OK")
+    return True
+
+
+async def scrape_external_posts(session: AsyncSession, archive_dir: Path,
+                                 authors: list[dict],
+                                 external_links: list[tuple]):
+    """Скачивает все внешние посты и перезаписывает ссылки на них."""
+    if not external_links:
+        return
+
+    # Дедупликация: один и тот же пост может быть у нескольких авторов
+    # Группируем: для каждого (ref_nick, ext_nick, post_id) → скачать в ref_nick/Content/
+    print(f"\n{'='*60}")
+    print(f"  Downloading {len(external_links)} external posts (one level deep)...")
+    print(f"{'='*60}")
+
+    total_ext = len(external_links)
+    counter = {"done": 0}
+    sem = asyncio.Semaphore(PARALLEL_POSTS)
+
+    async def _dl_one(ref_nick, ext_nick, url, post_id):
+        async with sem:
+            counter["done"] += 1
+            num = counter["done"]
+            print(f"\n  [{num}/{total_ext}] ext {ext_nick}/{post_id}")
+            dest_dir = archive_dir / ref_nick / "Content"
+            filename = f"ext_{ext_nick}_{post_id}.html"
+            ext_base = f"https://{ext_nick}.livejournal.com/"
+            ok = await scrape_external_post(session, url, dest_dir, filename, ext_base)
+            await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+            return ok, ref_nick, ext_nick, post_id
+
+    tasks = [_dl_one(*link) for link in external_links]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Теперь перезаписываем ссылки на скачанные внешние посты
+    downloaded = set()
+    for r in results:
+        if isinstance(r, Exception):
+            continue
+        ok, ref_nick, ext_nick, post_id = r
+        if ok:
+            downloaded.add((ref_nick, ext_nick, post_id))
+
+    if not downloaded:
+        return
+
+    # Проходим по файлам и заменяем ссылки на внешние посты
+    for author in authors:
+        nick = author["nickname"]
+        content_dir = archive_dir / nick / "Content"
+        if not content_dir.exists():
+            continue
+
+        for fpath in content_dir.glob("*.html"):
+            if not fpath.stem.isdigit():
+                continue
+            try:
+                html = fpath.read_text(encoding="utf-8")
+            except Exception:
+                continue
+
+            modified = False
+
+            def _replace_ext(m):
+                nonlocal modified
+                target_nick = (m.group(2) or m.group(3) or "").lower()
+                post_id = m.group(4)
+                if (nick, target_nick, post_id) in downloaded:
+                    modified = True
+                    return f'href="ext_{target_nick}_{post_id}.html"'
+                return m.group(0)
+
+            new_html = _LJ_POST_URL_RE.sub(_replace_ext, html)
+            if modified:
+                fpath.write_text(new_html, encoding="utf-8")
+
+    print(f"  External posts downloaded: {len(downloaded)}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ГЕНЕРАЦИЯ ОБЩЕГО ИНДЕКСА (ТОП-УРОВЕНЬ)
+# ═══════════════════════════════════════════════════════════════
+
+def generate_top_level_index(archive_dir: Path, authors: list[dict]):
+    """Генерирует общий 01.MAIN.html со всеми авторами, годами, тегами и поиском."""
+    from collections import defaultdict
+
+    print("\n" + "=" * 60)
+    print("  Generating top-level index...")
+    print("=" * 60)
+
+    parser = etree.HTMLParser(encoding="utf-8")
+    all_posts = []  # (nick, post_data)
+    by_year = defaultdict(list)
+    by_tag = defaultdict(list)
+    by_author = defaultdict(list)
+
+    for author in authors:
+        nick = author["nickname"]
+        content_dir = archive_dir / nick / "Content"
+        if not content_dir.exists():
+            continue
+
+        for fpath in sorted(content_dir.glob("*.html"),
+                            key=lambda p: int(p.stem) if p.stem.isdigit() else 0):
+            if not fpath.stem.isdigit():
+                continue
+            try:
+                raw = fpath.read_bytes()
+                doc = etree.fromstring(raw, parser)
+                title_el = doc.find(".//h1")
+                title = _el_text(title_el) if title_el is not None else f"Post {fpath.stem}"
+
+                html_root = doc.getroottree().getroot()
+                year = (html_root.get("data-year", "") or "")[:4]
+                post_date = html_root.get("data-date", "") if html_root is not None else ""
+                tags_raw = html_root.get("data-tags", "") if html_root is not None else ""
+                tags = [t.strip().lstrip("#") for t in tags_raw.split("|") if t.strip()]
+
+                p = {
+                    "post_id": fpath.stem, "title": title or f"Post {fpath.stem}",
+                    "year": year, "tags": tags, "file": fpath.name,
+                    "post_date": post_date, "nick": nick,
+                    "rel_path": f"{nick}/Content/{fpath.name}",
+                }
+                all_posts.append(p)
+                by_author[nick].append(p)
+                by_year[year or "?"].append(p)
+                for t in tags:
+                    by_tag[t].append(p)
+            except Exception:
+                pass
+
+    # Секция авторов
+    author_cards = []
+    for author in authors:
+        nick = author["nickname"]
+        cnt = len(by_author.get(nick, []))
+        author_cards.append(
+            f'<a class="year-card" href="{nick}/01.MAIN.html" style="min-width:180px">'
+            f'<span class="yr">{nick}</span>'
+            f'<span class="cnt">{cnt} постов</span></a>'
+        )
+    authors_html = "\n".join(author_cards)
+
+    # Секция годов (с указанием авторов)
+    years_html = "\n".join(
+        f'<a class="year-card" href="javascript:void(0)" onclick="this.querySelector(\'.cnt\').style.display=\'block\'">'
+        f'<span class="yr">{yr}</span>'
+        f'<span class="cnt">{len(ps)} постов</span></a>'
+        for yr, ps in sorted(by_year.items())
+    )
+
+    # Секция тегов
+    tags_html = "\n".join(
+        f'<a class="tag-chip" href="javascript:void(0)">'
+        f'{t}<span class="tag-count">{len(ps)}</span></a>'
+        for t, ps in sorted(by_tag.items(), key=lambda x: -len(x[1]))
+    )
+
+    total = len(all_posts)
+
+    # Объединённый поисковый индекс
+    print("  Building combined search index...")
+    index_entries = []
+    for p in all_posts:
+        nick = p["nick"]
+        content_dir = archive_dir / nick / "Content"
+        try:
+            fpath = content_dir / p["file"]
+            raw = fpath.read_bytes()
+            doc = etree.fromstring(raw, parser)
+            for el in doc.iter("script", "style"):
+                el.getparent().remove(el)
+            plain = etree.tostring(doc, method="text", encoding="unicode")
+            plain = re.sub(r"\s+", " ", plain).lower()
+        except Exception:
+            plain = p["title"].lower()
+        index_entries.append({
+            "file": p["rel_path"], "title": f"[{nick}] {p['title']}",
+            "date": p.get("post_date", ""), "year": p["year"],
+            "text": plain,
+        })
+
+    index_js = "var LJ_SEARCH_INDEX = " + json.dumps(
+        index_entries, ensure_ascii=False, separators=(",", ":")
+    ) + ";"
+    (archive_dir / "search_index.js").write_text(index_js, encoding="utf-8")
+    size_kb = (archive_dir / "search_index.js").stat().st_size // 1024
+    print(f"  Combined search_index.js: {size_kb} KB, {len(index_entries)} posts")
+
+    # Поиск — с путём к объединённому индексу
+    search_html = SEARCH_BLOCK_TEMPLATE.replace(
+        'src="Content/search_index.js"', 'src="search_index.js"'
+    ).replace(
+        'href="Content/', 'href="'
+    )
+
+    body_parts = [
+        '<div class="site-header">',
+        f'  <div class="site-title">Архив LiveJournal</div>',
+        f'  <div class="site-subtitle">{len(authors)} авторов · {total} постов</div>',
+        '</div>',
+        '<div class="section-label" style="margin-top:36px">Авторы</div>',
+        f'<div class="years-grid" style="margin-bottom:40px">{authors_html}</div>',
+        '<div class="section-label">Годы (все авторы)</div>',
+        f'<div class="years-grid" style="margin-bottom:40px">{years_html}</div>',
+        '<div class="section-label">Теги (все авторы)</div>',
+        f'<div class="tags-cloud">{tags_html or "<span class=empty-note>Теги не найдены</span>"}</div>',
+        search_html,
+    ]
+    body = "\n".join(body_parts)
+    main_page = _nav_page("Архив LiveJournal", body)
+    (archive_dir / "01.MAIN.html").write_text(main_page, encoding="utf-8")
+    print(f"  Top-level 01.MAIN.html created")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ТОЧКА ВХОДА
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 60)
+    print("  LiveJournal Archive Scraper")
+    print("  Multi-author edition")
+    print("=" * 60)
+
+    # 1. Ввод параметров
+    authors = ask_authors()
+    archive_dir = ask_archive_dir()
+
+    # Если все авторы — одиночные посты, годы не нужны
+    all_single = all(a["single_post_url"] for a in authors)
+    years = [] if all_single else ask_years()
+
+    # 2. Проверка существующих архивов
+    skip_existing = check_existing_archives(archive_dir, authors)
+
+    # 3. Запуск async-пайплайна
+    asyncio.run(_async_main(archive_dir, authors, years, skip_existing))
+
+
+async def _async_main(archive_dir: Path, authors: list[dict],
+                       years: list[int], skip_existing: dict[str, bool]):
+    """Основной async-пайплайн: скачивание → кросс-ссылки → внешние посты → индексы."""
+
+    async with AsyncSession(impersonate="chrome", headers=_CHROME_HEADERS) as session:
+
+        # ── Фаза 1: Сбор URL и скачивание постов для каждого автора ──
+        total_stats = {"success": 0, "skipped": 0, "errors": 0}
+
+        for author in authors:
+            nick = author["nickname"]
+            base_url = author["base_url"]
+            author_dir = archive_dir / nick
+            content_dir = author_dir / "Content"
+            content_dir.mkdir(parents=True, exist_ok=True)
+
             print(f"\n{'='*60}")
-            print(f"  RETRY round {retry_round}: {len(retry_list)} failed posts")
-            print(f"  Waiting 10s before retry...")
+            print(f"  Author: {nick}")
             print(f"{'='*60}")
-            await asyncio.sleep(10)
-            error_count -= len(retry_list)
-            consecutive_errors = 0
 
-            # Ретраи с уменьшенным параллелизмом
-            retry_sem = asyncio.Semaphore(max(1, PARALLEL_POSTS // (retry_round + 1)))
+            if author["single_post_url"]:
+                post_urls = [author["single_post_url"]]
+            else:
+                post_urls = await collect_all_post_urls(session, base_url, years)
 
-            async def _retry_one(idx: int, purl: str):
-                nonlocal success_count, error_count, consecutive_errors
-                pid = extract_post_id(purl)
-                async with retry_sem:
-                    print(f"\n  [retry] Post {pid}")
-                    try:
-                        ok = await scrape_post(session, purl, content_dir, author_base)
-                        if ok:
-                            success_count += 1
-                            consecutive_errors = 0
-                        else:
-                            error_count += 1
-                            consecutive_errors += 1
-                            failed_items.append((idx, purl))
-                    except Exception as e:
-                        print(f"  [{pid}] Error: {e}")
-                        error_count += 1
-                        failed_items.append((idx, purl))
-                    await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+            if not post_urls:
+                print(f"\n  No posts found for {nick}.")
+                continue
 
-            retry_tasks = [_retry_one(idx, purl) for idx, purl in retry_list]
-            await asyncio.gather(*retry_tasks)
+            print(f"\n  Found {len(post_urls)} posts for {nick}")
 
-        print("\n" + "=" * 60)
-        print(f"  DONE")
-        print(f"  Downloaded: {success_count}")
-        print(f"  Skipped:    {skip_count}")
-        print(f"  Errors:     {error_count}")
-        if failed_items:
-            print(f"  Failed IDs: {', '.join(extract_post_id(u) or '?' for _, u in failed_items)}")
-        print(f"  Root:       {archive_dir}")
-        print(f"  Content:    {content_dir}")
-        print("=" * 60)
+            stats = await download_author_posts(
+                session, post_urls, content_dir, base_url,
+                skip_existing=skip_existing.get(nick, True)
+            )
 
-    generate_index(archive_dir, author_base, content_dir=content_dir)
+            total_stats["success"] += stats["success"]
+            total_stats["skipped"] += stats["skipped"]
+            total_stats["errors"] += stats["errors"]
+
+            if stats["failed"]:
+                ids = ", ".join(extract_post_id(u) or "?" for _, u in stats["failed"])
+                print(f"  Failed: {ids}")
+
+        # ── Фаза 2: Кросс-авторские ссылки ──
+        print(f"\n{'='*60}")
+        print(f"  Rewriting cross-author links...")
+        print(f"{'='*60}")
+        external_links = collect_and_rewrite_cross_links(archive_dir, authors)
+        print(f"  Found {len(external_links)} external post links")
+
+        # ── Фаза 3: Скачивание внешних постов (один уровень) ──
+        if external_links:
+            await scrape_external_posts(session, archive_dir, authors, external_links)
+
+    # ── Фаза 4: Генерация индексов (вне сессии — только файловые операции) ──
+
+    # Per-author sub-main
+    for author in authors:
+        nick = author["nickname"]
+        author_dir = archive_dir / nick
+        content_dir = author_dir / "Content"
+        if content_dir.exists():
+            generate_index(author_dir, author["base_url"],
+                          content_dir=content_dir,
+                          parent_link="../01.MAIN.html")
+
+    # Top-level main (только если >1 автора или всегда для единообразия)
+    generate_top_level_index(archive_dir, authors)
+
+    # ── Итоги ──
+    print("\n" + "=" * 60)
+    print(f"  ALL DONE")
+    print(f"  Downloaded: {total_stats['success']}")
+    print(f"  Skipped:    {total_stats['skipped']}")
+    print(f"  Errors:     {total_stats['errors']}")
+    print(f"  Archive:    {archive_dir}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
