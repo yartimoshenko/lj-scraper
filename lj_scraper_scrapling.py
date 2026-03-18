@@ -76,20 +76,21 @@ _HTML_PARSER_CP1251 = etree.HTMLParser(encoding="windows-1251")
 
 
 def _detect_encoding(raw: bytes) -> str:
-    """Определяет кодировку HTML по мета-тегу или BOM."""
-    # Ищем charset в первых 2000 байтах
+    """Определяет кодировку HTML по мета-тегу и проверке байтов."""
     head = raw[:2000].lower()
-    # <meta charset="windows-1251">
+    # Ищем charset в мета-теге
     m = re.search(rb'charset=["\']?([\w-]+)', head)
+    declared = ""
     if m:
-        cs = m.group(1).decode("ascii", errors="ignore").lower()
-        if cs in ("windows-1251", "cp1251", "win-1251"):
+        declared = m.group(1).decode("ascii", errors="ignore").lower()
+        if declared in ("windows-1251", "cp1251", "win-1251"):
             return "windows-1251"
-        if cs in ("koi8-r", "koi8r"):
+        if declared in ("koi8-r", "koi8r"):
             return "koi8-r"
-    # Пробуем декодировать как UTF-8 — если ошибка, значит cp1251
+    # Даже если объявлен utf-8, проверяем реальное содержимое
+    # (ЖЖ иногда врёт в мета-теге)
     try:
-        raw[:500].decode("utf-8")
+        raw.decode("utf-8")
     except UnicodeDecodeError:
         return "windows-1251"
     return "utf-8"
@@ -238,6 +239,12 @@ def safe_filename(url: str, ext_hint: str = "") -> str:
     if not name or len(name) > 80:
         name = hashlib.md5(url.encode()).hexdigest()[:12]
     name = name.split("?")[0]
+    # Убираем символы, запрещённые в Windows: < > : " / \ | ? *
+    name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    if len(name) > 120:
+        # Слишком длинное имя — хешируем
+        ext = Path(name).suffix.lower()
+        name = hashlib.md5(url.encode()).hexdigest()[:12] + ext
     stem = Path(name).stem or name
     url_ext = Path(name).suffix.lower()
     if ext_hint:
